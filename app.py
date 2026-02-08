@@ -192,6 +192,53 @@ class ScanResult:
         }
 
 # ============================================================================
+# SENTIMENT ANALYZER - MISSING CLASS DEFINED
+# ============================================================================
+
+class SentimentAnalyzer:
+    """Complete sentiment analysis"""
+    
+    def __init__(self):
+        self.real_sentiment_collector = RealSentimentCollector()
+        
+    def analyze_pair(self, pair: str) -> Dict:
+        """Analyze sentiment for a currency pair"""
+        try:
+            cache_key = f"sentiment_full_{pair}_{datetime.now().date()}"
+            cached = cache.get(cache_key)
+            if cached:
+                return cached
+            
+            # Get real sentiment data
+            sentiment_data = self.real_sentiment_collector.get_sentiment_for_pair(pair)
+            
+            # Calculate final sentiment score (0-20)
+            score = sentiment_data['score']
+            
+            result = {
+                'score': score,
+                'data': sentiment_data,
+                'summary': sentiment_data['summary'],
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            cache.set(cache_key, result)
+            return result
+            
+        except Exception as e:
+            logger.error(f"Sentiment analysis error for {pair}: {e}")
+            return self._get_fallback_sentiment()
+    
+    def _get_fallback_sentiment(self) -> Dict:
+        """Fallback sentiment data"""
+        return {
+            'score': 10,
+            'data': {'available': False, 'reason': 'Fallback'},
+            'summary': 'Sentiment analysis unavailable - using fallback',
+            'timestamp': datetime.now().isoformat()
+        }
+
+# ============================================================================
 # REAL SENTIMENT DATA - PRODUCTION READY
 # ============================================================================
 

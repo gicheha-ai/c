@@ -52,7 +52,7 @@ class Config:
         "NEWSAPI_KEY", "1aa9d2e514c9469495338f3cf20be563"
     ))
     DERIV_TOKEN: str = field(default_factory=lambda: os.environ.get(
-        "DERIV_TOKEN", "7LndOxnscxGr"
+        "DERIV_TOKEN", "d58VWSjiGFjkmC2"
     ))
     
     # Scanner Settings

@@ -49,7 +49,7 @@ class Config:
         "TWELVEDATA_KEY", "2664b95fd52c490bb422607ef142e61f"
     ))
     DERIV_TOKEN: str = field(default_factory=lambda: os.environ.get(
-        "DERIV_TOKEN", "7LndOxnscxGr"
+        "DERIV_TOKEN", "QYNCxz5THr2WwE9"
     ))
     
     # Scanner Settings

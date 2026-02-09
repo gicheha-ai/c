@@ -172,7 +172,7 @@ ALL_PAIRS = generate_all_pairs(config.BASE_CURRENCIES)
 logger.info(f"Generated {len(ALL_PAIRS)} pairs for analysis")
 
 # ============================================================================
-# DATA CLASSES
+# DATA CLASSES - FIXED VERSION
 # ============================================================================
 
 @dataclass
@@ -181,7 +181,8 @@ class Opportunity:
     pair: str
     direction: str
     confluence_score: int
-    setup_type: str
+    setup_type: str  # CHANGED: No default value, moved before catalyst
+    catalyst: str = "Pure Technical Analysis"  # CHANGED: Moved after setup_type
     entry_price: float
     stop_loss: float
     take_profit: float
@@ -197,7 +198,6 @@ class Opportunity:
     sentiment_summary: str
     detected_at: str
     scan_id: str
-    catalyst: str = "Pure Technical Analysis"
     fundamentals_summary: str = "Technical Analysis Only - No News Catalysts"
     
     # Technical score breakdown
@@ -1981,8 +1981,8 @@ class ForexTechnicalSentinel:
                                 pair=pair,
                                 direction=direction,
                                 confluence_score=total_score,
-                                catalyst="Pure Technical Analysis",
                                 setup_type=technical['summary'],
+                                catalyst="Pure Technical Analysis",  # CHANGED: Now in correct position
                                 entry_price=entry_price,
                                 stop_loss=tp_sl['stop_loss'],
                                 take_profit=tp_sl['take_profit'],

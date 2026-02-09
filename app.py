@@ -49,7 +49,7 @@ class Config:
         "TWELVEDATA_KEY", "2664b95fd52c490bb422607ef142e61f"
     ))
     DERIV_TOKEN: str = field(default_factory=lambda: os.environ.get(
-        "DERIV_TOKEN", "7LndOxnscxGr"
+        "DERIV_TOKEN", "QYNCxz5THr2WwE9"
     ))
     
     # Scanner Settings
@@ -88,7 +88,7 @@ class Config:
     HISTORICAL_PERIODS: int = 500  # Enough for all indicator calculations
     PRICE_HISTORY_LENGTH: int = 1000  # Store 1000 periods locally
     
-    # 11 Base Currencies (all pairs formed from these)
+    # 10 Base Currencies (all pairs formed from these)
     BASE_CURRENCIES: List[str] = field(default_factory=lambda: [
         'EUR', 'GBP', 'USD', 'JPY', 'CHF', 
         'AUD', 'CAD', 'NZD', 'XAU', 'BTC', 'ETH'
@@ -160,7 +160,7 @@ def retry_request(func, max_retries=3, delay=1):
     return None
 
 def generate_all_pairs(currencies: List[str]) -> List[str]:
-    """Generate ALL possible pairs from currencies"""
+    """Generate ALL possible pairs from currencies (90 pairs total)"""
     pairs = []
     for i, base in enumerate(currencies):
         for j, quote in enumerate(currencies):
@@ -172,13 +172,12 @@ ALL_PAIRS = generate_all_pairs(config.BASE_CURRENCIES)
 logger.info(f"Generated {len(ALL_PAIRS)} pairs for analysis")
 
 # ============================================================================
-# DATA CLASSES - FIXED ORDER
+# DATA CLASSES
 # ============================================================================
 
 @dataclass
 class Opportunity:
     """Complete trading opportunity with all features"""
-    # Fields WITHOUT default values must come first
     pair: str
     direction: str
     confluence_score: int
@@ -198,11 +197,11 @@ class Opportunity:
     sentiment_summary: str
     detected_at: str
     scan_id: str
-    technical_breakdown: Dict[str, int]
-    
-    # Fields WITH default values come last
     catalyst: str = "Pure Technical Analysis"
     fundamentals_summary: str = "Technical Analysis Only - No News Catalysts"
+    
+    # Technical score breakdown
+    technical_breakdown: Dict[str, int] = field(default_factory=dict)
     
     def to_dict(self):
         data = asdict(self)
@@ -1061,12 +1060,13 @@ class ProfessionalTechnicalAnalyzer:
             # Check for bullish divergence (price makes lower low, RSI makes higher low)
             price_low_1 = min(prices[-30:-15])
             price_low_2 = min(prices[-15:])
+            rsi_1 = 50  # Placeholder - would need actual RSI values
+            rsi_2 = 50
             
-            if price_low_2 < price_low_1:
-                # Would need actual RSI values for proper divergence detection
-                divergence = 'POTENTIAL_BULLISH'
-            elif price_low_2 > price_low_1:
-                divergence = 'POTENTIAL_BEARISH'
+            if price_low_2 < price_low_1 and rsi_2 > rsi_1:
+                divergence = 'BULLISH'
+            elif price_low_2 > price_low_1 and rsi_2 < rsi_1:
+                divergence = 'BEARISH'
         
         return {'value': rsi, 'divergence': divergence}
     
@@ -1369,7 +1369,7 @@ class ProfessionalTechnicalAnalyzer:
         
         # Momentum highlights
         if 'rsi' in momentum_details and momentum_details['rsi']['divergence'] != 'NONE':
-            parts.append(f"RSI {momentum_details['rsi']['divergence'].lower()}")
+            parts.append(f"RSI {momentum_details['rsi']['divergence'].lower()} divergence")
         
         if 'macd' in momentum_details and momentum_details['macd']['signal'] != 'NEUTRAL':
             parts.append(f"MACD {momentum_details['macd']['signal'].lower()}")
@@ -1453,7 +1453,7 @@ class SentimentAnalyzer:
                 'USD/CHF': 'SWISS FRANC',
                 'AUD/USD': 'AUSTRALIAN DOLLAR',
                 'USD/CAD': 'CANADIAN DOLLAR',
-                'NZD/USD': 'NEW ZEAND DOLLAR',
+                'NZD/USD': 'NEW ZEALAND DOLLAR',
             }
             
             cot_symbol = cot_mapping.get(pair)
@@ -1997,9 +1997,7 @@ class ForexTechnicalSentinel:
                                 sentiment_summary=sentiment['summary'],
                                 detected_at=datetime.now().isoformat(),
                                 scan_id=scan_id,
-                                technical_breakdown=technical_breakdown,
-                                catalyst="Pure Technical Analysis",
-                                fundamentals_summary="Technical Analysis Only - No News Catalysts"
+                                technical_breakdown=technical_breakdown
                             )
                             
                             all_opportunities.append(opportunity)

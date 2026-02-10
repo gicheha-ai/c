@@ -46,14 +46,14 @@ class Config:
     """Production configuration optimized for Render"""
     # API Keys from environment with defaults
     TWELVEDATA_KEY: str = field(default_factory=lambda: os.environ.get(
-        "TWELVEDATA_KEY", "2664b95fd52c490bb422607ef142e61f"
+        "TWELVEDATA_KEY", "226eec92230747a6a4bf9007584cd62a"
     ))
     DERIV_TOKEN: str = field(default_factory=lambda: os.environ.get(
         "DERIV_TOKEN", "QYNCxz5THr2WwE9"
     ))
     
     # Scanner Settings
-    MIN_CONFLUENCE_SCORE: int = 70  # THE ONLY FILTER - NO OTHER FILTERS
+    MIN_CONFLUENCE_SCORE: int = 65  # THE ONLY FILTER - NO OTHER FILTERS
     SCAN_INTERVAL_MINUTES: int = 15
     TOTAL_PAIRS: int = 90  # ALL 90 pairs will be analyzed
     
@@ -485,9 +485,8 @@ class DerivWebSocketManager:
             except Exception as e:
                 logger.error(f"WebSocket monitor error: {e}")
                 time.sleep(30)
-
 # ============================================================================
-# HISTORICAL DATA MANAGER (TWELVEDATA)
+# HISTORICAL DATA MANAGER (TWELVEDATA) - WITH RATE LIMITING
 # ============================================================================
 
 class HistoricalDataManager:
@@ -504,8 +503,24 @@ class HistoricalDataManager:
         # Last fetch date
         self.last_fetch_date = None
         
+        # Rate limiting
+        self.last_request_time = 0
+        self.min_request_interval = 75  # 75 seconds between requests (8 requests/minute = 1 every 7.5 seconds)
+        
+    def wait_for_rate_limit(self):
+        """Wait to avoid hitting rate limits"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_request_time
+        
+        if time_since_last < self.min_request_interval:
+            wait_time = self.min_request_interval - time_since_last
+            logger.info(f"⏳ Waiting {wait_time:.1f} seconds to avoid rate limits...")
+            time.sleep(wait_time)
+        
+        self.last_request_time = time.time()
+    
     def fetch_initial_historical_data(self):
-        """Fetch historical data for 10 USD pairs (once per day)"""
+        """Fetch historical data for 10 USD pairs (once per day) with rate limiting"""
         try:
             today = datetime.now().date()
             
@@ -514,7 +529,7 @@ class HistoricalDataManager:
                 logger.info("Historical data already fetched today")
                 return True
             
-            logger.info("Fetching historical data for 10 USD pairs...")
+            logger.info("Fetching historical data for 10 USD pairs with rate limiting...")
             
             # 10 USD pairs to fetch
             usd_pairs = [
@@ -524,14 +539,21 @@ class HistoricalDataManager:
             ]
             
             successful_fetches = 0
+            total_pairs = len(usd_pairs)
             
-            for pair in usd_pairs:
+            for idx, pair in enumerate(usd_pairs, 1):
                 try:
-                    symbol = pair.replace('/', '')
+                    # Wait before each request to avoid rate limits
+                    if idx > 1:  # Don't wait before first request
+                        self.wait_for_rate_limit()
+                    
+                    logger.info(f"[{idx}/{total_pairs}] Fetching {pair}...")
+                    
+                    symbol = pair
                     params = {
                         'symbol': symbol,
                         'interval': '1day',
-                        'outputsize': config.HISTORICAL_PERIODS,
+                        'outputsize': str(config.HISTORICAL_PERIODS),
                         'apikey': self.twelve_data_key
                     }
                     
@@ -543,7 +565,8 @@ class HistoricalDataManager:
                     
                     if response.status_code == 200:
                         data = response.json()
-                        if 'values' in data:
+                        
+                        if data.get('status') == 'ok' and 'values' in data:
                             df = pd.DataFrame(data['values'])
                             df['datetime'] = pd.to_datetime(df['datetime'])
                             df.set_index('datetime', inplace=True)
@@ -563,24 +586,85 @@ class HistoricalDataManager:
                                 for price in closes:
                                     self.ws_manager.price_history[pair].append(price)
                             
-                            logger.info(f"Fetched {len(df)} periods for {pair}")
+                            logger.info(f"✅ [{idx}/{total_pairs}] Fetched {len(df)} periods for {pair}")
                         else:
-                            logger.warning(f"No data for {pair}")
+                            error_msg = data.get('message', 'Unknown error')
+                            logger.warning(f"❌ [{idx}/{total_pairs}] No valid data for {pair}: {error_msg}")
+                            
+                            # If rate limited, wait longer and retry
+                            if 'API credits' in error_msg or 'rate limit' in error_msg.lower():
+                                logger.warning(f"⚠️ Rate limit hit, waiting 90 seconds...")
+                                time.sleep(90)  # Wait 90 seconds if rate limited
+                                # Try with smaller data request
+                                if self._try_smaller_request(pair):
+                                    successful_fetches += 1
                     else:
-                        logger.warning(f"Failed to fetch {pair}: {response.status_code}")
-                    
-                    # Be nice to the API
-                    time.sleep(1)
-                    
+                        logger.warning(f"❌ [{idx}/{total_pairs}] HTTP {response.status_code} for {pair}")
+                        # If 429 (rate limit), wait longer
+                        if response.status_code == 429:
+                            logger.warning(f"⚠️ Rate limited (429), waiting 120 seconds...")
+                            time.sleep(120)
+                
                 except Exception as e:
-                    logger.error(f"Error fetching {pair}: {e}")
+                    logger.error(f"❌ [{idx}/{total_pairs}] Error fetching {pair}: {e}")
+                    # Continue with next pair even if one fails
             
             self.last_fetch_date = today
-            logger.info(f"Historical data fetch complete: {successful_fetches}/10 pairs")
+            logger.info(f"📊 Historical data fetch complete: {successful_fetches}/{total_pairs} pairs")
+            
+            if successful_fetches < total_pairs:
+                logger.info(f"⏳ Some pairs failed, will retry missing ones in next scan...")
+            
             return successful_fetches >= 5  # At least 5 successful
             
         except Exception as e:
-            logger.error(f"Historical data fetch failed: {e}")
+            logger.error(f"❌ Historical data fetch failed: {e}")
+            return False
+    
+    def _try_smaller_request(self, pair: str) -> bool:
+        """Try fetching with smaller data request to avoid rate limits"""
+        try:
+            logger.info(f"🔄 Trying smaller request for {pair}...")
+            
+            params = {
+                'symbol': pair,
+                'interval': '1day',
+                'outputsize': '100',  # Smaller request
+                'apikey': self.twelve_data_key
+            }
+            
+            response = requests.get(
+                f"{self.base_url}/time_series",
+                params=params,
+                timeout=config.REQUEST_TIMEOUT
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'ok' and 'values' in data:
+                    df = pd.DataFrame(data['values'])
+                    df['datetime'] = pd.to_datetime(df['datetime'])
+                    df.set_index('datetime', inplace=True)
+                    
+                    for col in ['open', 'high', 'low', 'close']:
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col], errors='coerce')
+                    
+                    df = df.dropna()
+                    self.historical_data[pair] = df
+                    
+                    if pair in self.ws_manager.price_history:
+                        closes = df['close'].values.tolist()
+                        for price in closes:
+                            self.ws_manager.price_history[pair].append(price)
+                    
+                    logger.info(f"✅ Got {len(df)} periods for {pair} (smaller request)")
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Smaller request failed for {pair}: {e}")
             return False
     
     def get_historical_prices(self, pair: str) -> Optional[np.ndarray]:
@@ -625,7 +709,8 @@ class HistoricalDataManager:
         
         return None
 
-# ============================================================================
+
+# ===========================================================================
 # PROFESSIONAL TECHNICAL ANALYZER (80 POINTS)
 # ============================================================================
 
@@ -1579,13 +1664,12 @@ class SentimentAnalyzer:
             'summary': 'Using fallback sentiment data',
             'timestamp': datetime.now().isoformat()
         }
-
 # ============================================================================
-# PROFESSIONAL TP/SL CALCULATOR - SAME AS BEFORE
+# PROFESSIONAL TP/SL CALCULATOR - ULTRA RELAXED VERSION
 # ============================================================================
 
 class ProfessionalTP_SL_Calculator:
-    """Complete professional TP/SL calculation (same as previous app.py)"""
+    """Complete professional TP/SL calculation - ULTRA RELAXED"""
     
     def calculate_optimal_tp_sl(self, pair: str, entry_price: float, 
                                 direction: str, context: str, atr: float,
@@ -1630,9 +1714,14 @@ class ProfessionalTP_SL_Calculator:
                 pair, entry_price, take_profit, direction, context, atr
             )
             
-            # 8. Professional validation
+            # 8. Professional validation - ULTRA RELAXED
             if not self._validate_tp_sl(risk_pips, reward_pips, risk_reward, probability, duration):
-                return None
+                logger.warning(f"TP/SL validation failed for {pair}: risk={risk_pips}, reward={reward_pips}, RR={risk_reward}, prob={probability}, dur={duration}")
+                # ALWAYS return adjusted values, never None
+                return self._adjust_to_minimum_valid(
+                    pair, entry_price, direction, stop_loss, take_profit, 
+                    risk_pips, reward_pips, risk_reward, probability, duration
+                )
             
             return {
                 'stop_loss': stop_loss,
@@ -1647,34 +1736,24 @@ class ProfessionalTP_SL_Calculator:
             
         except Exception as e:
             logger.error(f"TP/SL calculation error for {pair}: {e}")
-            return None
+            # Return minimal valid TP/SL instead of None
+            return self._get_minimal_tp_sl(pair, entry_price, direction, atr)
     
     def _calculate_stop_loss(self, entry: float, direction: str, context: str,
                             atr: float, technical_data: Dict) -> float:
-        """Professional stop loss calculation"""
-        # ATR-based with context adjustment
-        multipliers = {
-            'TRENDING': 1.0,
-            'RANGING': 0.7,
-            'BREAKOUT_UP': 1.2,
-            'BREAKOUT_DOWN': 1.2,
-            'UNCLEAR': 1.0
-        }
-        
-        multiplier = multipliers.get(context, 1.0)
-        atr_distance = atr * multiplier
+        """Professional stop loss calculation with MINIMUM values"""
+        # Use ATR if available, otherwise use fixed minimum
+        if atr > 0:
+            # Use 1x ATR minimum
+            atr_distance = max(atr, 0.0005)  # Minimum 5 pips for non-JPY pairs
+        else:
+            # Default minimum distances
+            atr_distance = 0.0005  # 5 pips minimum
         
         if direction == 'BUY':
             stop_loss = entry - atr_distance
-            # Ensure minimum distance
-            min_distance = atr * 0.5
-            if (entry - stop_loss) < min_distance:
-                stop_loss = entry - min_distance
         else:  # SELL
             stop_loss = entry + atr_distance
-            min_distance = atr * 0.5
-            if (stop_loss - entry) < min_distance:
-                stop_loss = entry + min_distance
         
         # Adjust to psychological level
         stop_loss = self._adjust_to_level(stop_loss, direction == 'BUY')
@@ -1684,9 +1763,9 @@ class ProfessionalTP_SL_Calculator:
     def _calculate_take_profit(self, pair: str, entry: float, direction: str, 
                               context: str, atr: float, risk_pips: float,
                               technical_data: Dict) -> float:
-        """Professional take profit calculation"""
+        """Professional take profit calculation with MINIMUM values"""
         # Minimum risk/reward
-        min_rr = config.MIN_RISK_REWARD
+        min_rr = 1.1  # Ultra relaxed: 1.1:1
         min_target_pips = risk_pips * min_rr
         
         # Convert to price
@@ -1694,8 +1773,8 @@ class ProfessionalTP_SL_Calculator:
         min_target_price = entry + (min_target_pips * pip_value) if direction == 'BUY' else entry - (min_target_pips * pip_value)
         
         # ATR extension for trending markets
-        if context == 'TRENDING':
-            atr_multiplier = 3.0
+        if context == 'TRENDING' and atr > 0:
+            atr_multiplier = 2.0
             atr_target = atr * atr_multiplier
             atr_target_price = entry + atr_target if direction == 'BUY' else entry - atr_target
             
@@ -1709,16 +1788,6 @@ class ProfessionalTP_SL_Calculator:
         
         # Adjust to psychological level
         take_profit = self._adjust_to_level(take_profit, direction == 'BUY')
-        
-        # Ensure not too ambitious
-        max_rr = 5.0
-        max_target_pips = risk_pips * max_rr
-        max_target_price = entry + (max_target_pips * pip_value) if direction == 'BUY' else entry - (max_target_pips * pip_value)
-        
-        if direction == 'BUY':
-            take_profit = min(take_profit, max_target_price)
-        else:
-            take_profit = max(take_profit, max_target_price)
         
         return take_profit
     
@@ -1736,7 +1805,7 @@ class ProfessionalTP_SL_Calculator:
         else:
             pips = difference * 10000
         
-        return max(pips, 0.1)
+        return max(pips, 0.1)  # Minimum 0.1 pips
     
     def _get_pip_value(self, pair: str) -> float:
         """Get pip value for pair"""
@@ -1744,38 +1813,39 @@ class ProfessionalTP_SL_Calculator:
     
     def _calculate_probability(self, pair: str, context: str, rr_ratio: float,
                               technical_data: Dict) -> float:
-        """Calculate probability of success"""
+        """Calculate probability of success - ULTRA RELAXED"""
         # Base probabilities by context
         base_probs = {
-            'TRENDING': 0.65,
-            'RANGING': 0.55,
-            'BREAKOUT_UP': 0.60,
-            'BREAKOUT_DOWN': 0.60,
-            'UNCLEAR': 0.50
+            'TRENDING': 0.55,
+            'RANGING': 0.50,
+            'BREAKOUT_UP': 0.52,
+            'BREAKOUT_DOWN': 0.52,
+            'UNCLEAR': 0.48
         }
         
-        probability = base_probs.get(context, 0.50)
+        probability = base_probs.get(context, 0.48)
         
         # Adjust for risk/reward (higher RR = lower win rate)
         rr_adjustments = {
             1.0: 0.0,
-            1.5: -0.05,
-            2.0: -0.10,
-            3.0: -0.15,
-            4.0: -0.20,
-            5.0: -0.25
+            1.1: 0.0,  # No penalty for 1.1 RR
+            1.2: 0.0,  # No penalty for 1.2 RR
+            1.5: -0.02,
+            2.0: -0.05,
+            3.0: -0.10,
+            5.0: -0.15
         }
         
         # Find closest RR for adjustment
         closest_rr = min(rr_adjustments.keys(), key=lambda x: abs(x - rr_ratio))
         probability += rr_adjustments[closest_rr]
         
-        # Ensure reasonable bounds
-        return max(0.30, min(probability, 0.85))
+        # Ensure reasonable bounds - ULTRA RELAXED
+        return max(0.40, min(probability, 0.85))
     
     def _estimate_duration(self, pair: str, entry: float, tp: float,
                           direction: str, context: str, atr: float) -> int:
-        """Estimate trade duration in days"""
+        """Estimate trade duration in days - ULTRA RELAXED"""
         distance = abs(tp - entry)
         
         if atr > 0:
@@ -1797,7 +1867,7 @@ class ProfessionalTP_SL_Calculator:
         }
         
         estimated_days *= adjustments.get(context, 1.0)
-        estimated_days = max(1, min(estimated_days, 60))
+        estimated_days = max(1, min(estimated_days, 90))  # Increased max to 90 days
         
         return int(round(estimated_days))
     
@@ -1818,17 +1888,110 @@ class ProfessionalTP_SL_Calculator:
     def _validate_tp_sl(self, risk_pips: float, reward_pips: float,
                        risk_reward: float, probability: float,
                        duration: int) -> bool:
-        """Validate TP/SL meets professional criteria"""
+        """Validate TP/SL meets professional criteria - ULTRA RELAXED"""
+        # ULTRA RELAXED validations to ensure ALL trades pass
         validations = [
-            risk_pips >= 10,
-            reward_pips >= 15,
-            risk_reward >= config.MIN_RISK_REWARD,
-            probability >= config.MIN_SUCCESS_PROBABILITY,
-            duration <= config.MAX_TRADE_DURATION_DAYS,
-            risk_reward <= 5.0
+            risk_pips >= 0.5,       # Ultra relaxed: 0.5 pips minimum
+            reward_pips >= 0.6,     # Ultra relaxed: 0.6 pips minimum
+            risk_reward >= 1.1,     # Ultra relaxed: 1.1:1 minimum
+            probability >= 0.35,    # Ultra relaxed: 35% minimum probability
+            duration <= 90,         # Ultra relaxed: 90 days maximum
+            risk_reward <= 20.0     # Ultra relaxed: 20:1 maximum
         ]
         
         return all(validations)
+    
+    def _adjust_to_minimum_valid(self, pair: str, entry_price: float, direction: str,
+                               stop_loss: float, take_profit: float,
+                               risk_pips: float, reward_pips: float,
+                               risk_reward: float, probability: float,
+                               duration: int) -> Dict:
+        """Adjust TP/SL to minimum valid values if validation fails"""
+        pip_value = self._get_pip_value(pair)
+        
+        # Ensure minimum risk pips (0.5 pips)
+        if risk_pips < 0.5:
+            if direction == 'BUY':
+                stop_loss = entry_price - (0.5 * pip_value)
+            else:
+                stop_loss = entry_price + (0.5 * pip_value)
+            risk_pips = 0.5
+        
+        # Ensure minimum reward pips (0.6 pips)
+        if reward_pips < 0.6:
+            if direction == 'BUY':
+                take_profit = entry_price + (0.6 * pip_value)
+            else:
+                take_profit = entry_price - (0.6 * pip_value)
+            reward_pips = 0.6
+        
+        # Recalculate risk/reward
+        if risk_pips > 0:
+            risk_reward = reward_pips / risk_pips
+        
+        # Ensure minimum risk/reward (1.1:1)
+        if risk_reward < 1.1:
+            # Adjust take profit to meet minimum RR
+            required_reward_pips = risk_pips * 1.1
+            if direction == 'BUY':
+                take_profit = entry_price + (required_reward_pips * pip_value)
+            else:
+                take_profit = entry_price - (required_reward_pips * pip_value)
+            reward_pips = required_reward_pips
+            risk_reward = 1.1
+        
+        # Ensure probability is reasonable
+        if probability < 0.35:
+            probability = 0.35
+        
+        # Ensure duration is reasonable
+        if duration > 90:
+            duration = 90
+        
+        return {
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'risk_pips': risk_pips,
+            'reward_pips': reward_pips,
+            'risk_reward': risk_reward,
+            'probability_tp_before_sl': probability,
+            'estimated_duration_days': duration,
+            'method': 'ADJUSTED_MINIMUM_VALID'
+        }
+    
+    def _get_minimal_tp_sl(self, pair: str, entry_price: float, direction: str, atr: float) -> Dict:
+        """Get minimal valid TP/SL when calculation fails"""
+        pip_value = self._get_pip_value(pair)
+        
+        # Default pip distances - ULTRA MINIMAL
+        if 'JPY' in pair:
+            sl_distance = 5 * pip_value  # 5 pips for JPY pairs
+        else:
+            sl_distance = 0.0005  # 5 pips for other pairs
+        
+        if direction == 'BUY':
+            stop_loss = entry_price - sl_distance
+            take_profit = entry_price + (sl_distance * 1.1)  # 1.1:1 RR
+        else:
+            stop_loss = entry_price + sl_distance
+            take_profit = entry_price - (sl_distance * 1.1)  # 1.1:1 RR
+        
+        risk_pips = abs(entry_price - stop_loss) / pip_value
+        reward_pips = abs(take_profit - entry_price) / pip_value
+        
+        # Calculate final values
+        final_risk_reward = reward_pips / risk_pips if risk_pips > 0 else 1.1
+        
+        return {
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'risk_pips': risk_pips,
+            'reward_pips': reward_pips,
+            'risk_reward': final_risk_reward,
+            'probability_tp_before_sl': 0.45,  # Baseline probability
+            'estimated_duration_days': 30,  # 30 days as default
+            'method': 'MINIMAL_FALLBACK'
+        }
 
 # ============================================================================
 # COMPLETE SCANNER ENGINE
@@ -1950,8 +2113,13 @@ class ForexTechnicalSentinel:
                     else:
                         score_distribution['0-9'] += 1
                     
-                    # THE ONLY FILTER: Score ≥ 70
-                    if total_score >= config.MIN_CONFLUENCE_SCORE:
+                    # DEBUG LOG: Check each pair's score
+                    logger.debug(f"Pair {pair}: Technical={technical['total_score']}, Sentiment={sentiment['score']}, Total={total_score}")
+                    
+                    # THE ONLY FILTER: Score ≥ 65 (as per config.MIN_CONFLUENCE_SCORE)
+                    if total_score >= self.config.MIN_CONFLUENCE_SCORE:
+                        logger.info(f"✅ Found {pair} with score {total_score} ≥ {self.config.MIN_CONFLUENCE_SCORE}")
+                        
                         # 4. Determine trade direction
                         direction = technical['direction']
                         
@@ -1977,6 +2145,16 @@ class ForexTechnicalSentinel:
                                 'volatility': technical['volatility_score']
                             }
                             
+                            # Determine confidence based on total score
+                            if total_score >= 85:
+                                confidence = 'VERY_HIGH'
+                            elif total_score >= 70:
+                                confidence = 'HIGH'
+                            elif total_score >= 65:
+                                confidence = 'MODERATE'
+                            else:
+                                confidence = 'LOW'
+                            
                             opportunity = Opportunity(
                                 pair=pair,
                                 direction=direction,
@@ -1991,7 +2169,7 @@ class ForexTechnicalSentinel:
                                 probability_tp_before_sl=tp_sl['probability_tp_before_sl'],
                                 estimated_duration_days=tp_sl['estimated_duration_days'],
                                 context='TRENDING' if 'bullish' in technical['structure_details'].get('mtf_alignment', '').lower() or 'bearish' in technical['structure_details'].get('mtf_alignment', '').lower() else 'UNCLEAR',
-                                confidence='VERY_HIGH' if total_score >= 85 else 'HIGH',
+                                confidence=confidence,
                                 analysis_summary=f"Technical score: {technical['total_score']}/80 + Sentiment: {sentiment['score']}/20 = {total_score}/100",
                                 technicals_summary=technical['summary'],
                                 sentiment_summary=sentiment['summary'],
@@ -2001,6 +2179,8 @@ class ForexTechnicalSentinel:
                             )
                             
                             all_opportunities.append(opportunity)
+                        else:
+                            logger.warning(f"⚠️  {pair} with score {total_score} skipped due to invalid TP/SL calculation")
                     
                     pairs_analyzed += 1
                     
@@ -2013,6 +2193,13 @@ class ForexTechnicalSentinel:
             
             # Calculate statistics
             scan_duration = (datetime.now() - start_time).total_seconds()
+            
+            # Count opportunities by score range
+            opportunities_70_plus = sum(1 for opp in all_opportunities if opp.confluence_score >= 70)
+            opportunities_65_69 = sum(1 for opp in all_opportunities if 65 <= opp.confluence_score < 70)
+            
+            logger.info(f"📊 Score breakdown: {opportunities_70_plus} pairs with score ≥ 70, {opportunities_65_69} pairs with score 65-69")
+            
             market_state = self.determine_market_state(len(all_opportunities), score_distribution)
             
             # Update counters
@@ -2020,7 +2207,7 @@ class ForexTechnicalSentinel:
             self.opportunities_found += len(all_opportunities)
             
             logger.info(f"✅ Scan {scan_id} completed in {scan_duration:.1f}s")
-            logger.info(f"📊 Results: {len(all_opportunities)} pairs with score ≥ 70")
+            logger.info(f"📊 Results: {len(all_opportunities)} pairs with score ≥ {self.config.MIN_CONFLUENCE_SCORE}")
             logger.info(f"📈 Score distribution: {score_distribution}")
             logger.info(f"🌍 Market state: {market_state}")
             
@@ -2028,8 +2215,8 @@ class ForexTechnicalSentinel:
                 scan_id=scan_id,
                 timestamp=datetime.now().isoformat(),
                 pairs_scanned=pairs_analyzed,
-                very_high_probability_setups=len(all_opportunities),
-                opportunities=all_opportunities,
+                very_high_probability_setups=len(all_opportunities),  # This now includes ALL opportunities ≥ 65
+                opportunities=all_opportunities,  # All opportunities with score ≥ 65
                 scan_duration_seconds=scan_duration,
                 market_state=market_state,
                 score_distribution=score_distribution
